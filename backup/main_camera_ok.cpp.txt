@@ -1,0 +1,1099 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLESecurity.h>
+
+// ============================================================
+// CONFIGURAÇÕES PADRÃO
+// ============================================================
+
+#define CAMERA_NAME "ZV-E10"
+
+#define DEFAULT_BUTTON_PIN 27
+
+#define DEFAULT_HALF_DOWN_DELAY 250
+#define DEFAULT_FULL_DOWN_DELAY 250
+#define DEFAULT_FULL_UP_DELAY   250
+#define DEFAULT_DEBOUNCE_DELAY   50
+#define DEFAULT_MIN_SHOT_DELAY  300
+
+// ============================================================
+// UUIDs Sony
+// ============================================================
+
+#define SONY_SERVICE_UUID "8000ff00-ff00-ffff-ffff-ffffffffffff"
+#define SONY_COMMAND_UUID "0000ff01-0000-1000-8000-00805f9b34fb"
+#define SONY_NOTIFY_UUID  "0000ff02-0000-1000-8000-00805f9b34fb"
+
+// ============================================================
+// WI-FI + PORTAL CATIVO
+// ============================================================
+
+const char* AP_SSID = "Sony-ESP32";
+const char* AP_PASSWORD = "12345678";
+
+const byte DNS_PORT = 53;
+
+WebServer server(80);
+DNSServer dnsServer;
+
+// ============================================================
+// MEMÓRIA
+// ============================================================
+
+Preferences preferences;
+
+// ============================================================
+// CONFIGURAÇÕES EDITÁVEIS
+// ============================================================
+
+int buttonPin = DEFAULT_BUTTON_PIN;
+
+unsigned long halfDownDelay = DEFAULT_HALF_DOWN_DELAY;
+unsigned long fullDownDelay = DEFAULT_FULL_DOWN_DELAY;
+unsigned long fullUpDelay   = DEFAULT_FULL_UP_DELAY;
+
+unsigned long debounceDelay = DEFAULT_DEBOUNCE_DELAY;
+unsigned long minShotDelay = DEFAULT_MIN_SHOT_DELAY;
+
+// ============================================================
+// STATUS
+// ============================================================
+
+BLEClient* pClient = nullptr;
+
+BLERemoteCharacteristic* pCommandCharacteristic = nullptr;
+BLERemoteCharacteristic* pNotifyCharacteristic = nullptr;
+
+bool connected = false;
+bool paired = false;
+bool shooting = false;
+
+unsigned long lastShotTime = 0;
+unsigned long photoCount = 0;
+
+// ============================================================
+// BOTÃO
+// ============================================================
+
+bool lastButtonReading = HIGH;
+bool stableButtonState = HIGH;
+
+unsigned long lastDebounceTime = 0;
+
+// ============================================================
+// SEGURANÇA BLE
+// ============================================================
+
+class MySecurity : public BLESecurityCallbacks
+{
+    uint32_t onPassKeyRequest()
+    {
+        Serial.println("Solicitacao de PIN");
+        return 133700;
+    }
+
+    void onPassKeyNotify(uint32_t pass_key)
+    {
+        Serial.print("PIN recebido: ");
+        Serial.println(pass_key);
+    }
+
+    bool onConfirmPIN(uint32_t pass_key)
+    {
+        Serial.print("Confirmando PIN: ");
+        Serial.println(pass_key);
+        return true;
+    }
+
+    bool onSecurityRequest()
+    {
+        Serial.println("Solicitacao de seguranca");
+        return true;
+    }
+
+    void onAuthenticationComplete(esp_ble_auth_cmpl_t auth_cmpl)
+    {
+        if (auth_cmpl.success)
+        {
+            Serial.println("Autenticacao BLE concluida.");
+            paired = true;
+        }
+        else
+        {
+            Serial.println("Falha na autenticacao BLE.");
+            paired = false;
+        }
+    }
+};
+
+// ============================================================
+// CALLBACKS DE CONEXÃO BLE
+// (detecta quando a câmera cai sozinha, ex: dormiu ou saiu de alcance)
+// ============================================================
+
+class MyClientCallback : public BLEClientCallbacks
+{
+    void onConnect(BLEClient* client) {}
+
+    void onDisconnect(BLEClient* client)
+    {
+        connected = false;
+        paired = false;
+
+        pCommandCharacteristic = nullptr;
+        pNotifyCharacteristic = nullptr;
+
+        Serial.println("Camera desconectou (evento BLE).");
+    }
+};
+
+// ============================================================
+// NOTIFICAÇÕES DA SONY
+// ============================================================
+
+void notifyCallback(
+    BLERemoteCharacteristic* characteristic,
+    uint8_t* data,
+    size_t length,
+    bool isNotify)
+{
+    Serial.println();
+    Serial.println("----------------------------------------");
+    Serial.println("RESPOSTA DA ZV-E10 - FF02");
+    Serial.print("HEX: ");
+
+    for (size_t i = 0; i < length; i++)
+    {
+        if (data[i] < 0x10)
+            Serial.print("0");
+
+        Serial.print(data[i], HEX);
+        Serial.print(" ");
+    }
+
+    Serial.println();
+    Serial.println("----------------------------------------");
+}
+
+// ============================================================
+// SALVAR / CARREGAR CONFIGURAÇÕES
+// ============================================================
+
+void saveSettings()
+{
+    preferences.begin("sonyremote", false);
+
+    preferences.putInt("buttonPin", buttonPin);
+
+    preferences.putULong("halfDown", halfDownDelay);
+    preferences.putULong("fullDown", fullDownDelay);
+    preferences.putULong("fullUp", fullUpDelay);
+
+    preferences.putULong("debounce", debounceDelay);
+    preferences.putULong("minShot", minShotDelay);
+
+    preferences.end();
+
+    Serial.println("Configuracoes salvas.");
+}
+
+void loadSettings()
+{
+    preferences.begin("sonyremote", true);
+
+    buttonPin = preferences.getInt("buttonPin", DEFAULT_BUTTON_PIN);
+
+    halfDownDelay = preferences.getULong("halfDown", DEFAULT_HALF_DOWN_DELAY);
+    fullDownDelay = preferences.getULong("fullDown", DEFAULT_FULL_DOWN_DELAY);
+    fullUpDelay   = preferences.getULong("fullUp", DEFAULT_FULL_UP_DELAY);
+
+    debounceDelay = preferences.getULong("debounce", DEFAULT_DEBOUNCE_DELAY);
+    minShotDelay  = preferences.getULong("minShot", DEFAULT_MIN_SHOT_DELAY);
+
+    preferences.end();
+
+    Serial.println("Configuracoes carregadas.");
+}
+
+// ============================================================
+// CONECTAR À CAMERA
+// ============================================================
+
+bool connectToCamera()
+{
+    if (connected)
+    {
+        Serial.println("Camera ja esta conectada.");
+        return true;
+    }
+
+    Serial.println();
+    Serial.println("Procurando ZV-E10...");
+
+    BLEScan* pScan = BLEDevice::getScan();
+
+    pScan->setActiveScan(true);
+
+    BLEScanResults results = pScan->start(10, false);
+
+    BLEAdvertisedDevice* cameraDevice = nullptr;
+
+    for (int i = 0; i < results.getCount(); i++)
+    {
+        BLEAdvertisedDevice device = results.getDevice(i);
+
+        String name = device.getName().c_str();
+
+        Serial.print("Dispositivo: ");
+        Serial.println(name);
+
+        if (name.indexOf(CAMERA_NAME) >= 0)
+        {
+            Serial.println("ZV-E10 encontrada!");
+
+            cameraDevice = new BLEAdvertisedDevice(device);
+            break;
+        }
+    }
+
+    // Libera a memoria dos resultados do scan (evita acumulo a cada reconexao)
+    pScan->clearResults();
+
+    if (cameraDevice == nullptr)
+    {
+        Serial.println("Camera nao encontrada.");
+        return false;
+    }
+
+    Serial.println("Conectando...");
+
+    pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new MyClientCallback());
+
+    bool ok = pClient->connect(cameraDevice);
+
+    // connect() ja copia o endereco internamente, o ponteiro pode ser liberado
+    delete cameraDevice;
+
+    if (!ok)
+    {
+        Serial.println("Falha ao conectar.");
+        return false;
+    }
+
+    Serial.println("Conectado à camera.");
+
+    BLERemoteService* pService =
+        pClient->getService(BLEUUID(SONY_SERVICE_UUID));
+
+    if (pService == nullptr)
+    {
+        Serial.println("Servico Sony nao encontrado.");
+        pClient->disconnect();
+        return false;
+    }
+
+    pCommandCharacteristic =
+        pService->getCharacteristic(BLEUUID(SONY_COMMAND_UUID));
+
+    pNotifyCharacteristic =
+        pService->getCharacteristic(BLEUUID(SONY_NOTIFY_UUID));
+
+    if (pCommandCharacteristic == nullptr)
+    {
+        Serial.println("Caracteristica FF01 nao encontrada.");
+        pClient->disconnect();
+        return false;
+    }
+
+    if (pNotifyCharacteristic != nullptr && pNotifyCharacteristic->canNotify())
+    {
+        pNotifyCharacteristic->registerForNotify(notifyCallback);
+        Serial.println("FF02 configurado.");
+    }
+
+    connected = true;
+
+    Serial.println("Camera pronta.");
+
+    return true;
+}
+
+// ============================================================
+// DESCONECTAR DA CAMERA
+// ============================================================
+
+void disconnectFromCamera()
+{
+    if (pClient != nullptr && connected)
+    {
+        pClient->disconnect();
+    }
+
+    connected = false;
+    paired = false;
+
+    pCommandCharacteristic = nullptr;
+    pNotifyCharacteristic = nullptr;
+
+    Serial.println("Camera desconectada.");
+}
+
+// ============================================================
+// DISPARO DA CAMERA
+// ============================================================
+
+// Envia um comando e confirma que a camera ainda esta conectada antes disso.
+// Retorna false se a sequencia deve ser abortada.
+bool sendShutterCommand(const uint8_t* cmd, size_t len, const char* label)
+{
+    if (!connected || pCommandCharacteristic == nullptr)
+    {
+        Serial.print("Sequencia abortada antes de enviar: ");
+        Serial.println(label);
+        return false;
+    }
+
+    Serial.print("Enviando ");
+    Serial.println(label);
+
+    pCommandCharacteristic->writeValue((uint8_t*)cmd, len, true);
+
+    return true;
+}
+
+void takePhoto()
+{
+    if (shooting)
+    {
+        Serial.println("Disparo ignorado: sequencia em andamento.");
+        return;
+    }
+
+    if (!connected || pCommandCharacteristic == nullptr)
+    {
+        Serial.println("Camera nao conectada.");
+        return;
+    }
+
+    if (millis() - lastShotTime < minShotDelay)
+    {
+        Serial.println("Disparo ignorado: intervalo minimo ainda nao terminou.");
+        return;
+    }
+
+    shooting = true;
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("DISPARANDO FOTO");
+    Serial.println("========================================");
+
+    bool ok = true;
+
+    uint8_t halfDown[] = {0x01, 0x07};
+    ok = sendShutterCommand(halfDown, sizeof(halfDown), "Shutter Half Down: 01 07");
+    if (ok) delay(halfDownDelay);
+
+    uint8_t fullyDown[] = {0x01, 0x09};
+    if (ok) ok = sendShutterCommand(fullyDown, sizeof(fullyDown), "Shutter Fully Down: 01 09");
+    if (ok) delay(fullDownDelay);
+
+    uint8_t fullyUp[] = {0x01, 0x08};
+    if (ok) ok = sendShutterCommand(fullyUp, sizeof(fullyUp), "Shutter Fully Up: 01 08");
+    if (ok) delay(fullUpDelay);
+
+    uint8_t halfUp[] = {0x01, 0x06};
+    if (ok) ok = sendShutterCommand(halfUp, sizeof(halfUp), "Shutter Half Up: 01 06");
+
+    if (ok)
+    {
+        photoCount++;
+        lastShotTime = millis();
+
+        Serial.println("Foto concluida.");
+        Serial.print("Total de fotos: ");
+        Serial.println(photoCount);
+    }
+    else
+    {
+        Serial.println("Sequencia de disparo interrompida (camera desconectou no meio do processo).");
+    }
+
+    shooting = false;
+
+    Serial.println("========================================");
+}
+
+// ============================================================
+// BOTÃO
+// ============================================================
+
+void configureButtonPin()
+{
+    pinMode(buttonPin, INPUT_PULLUP);
+
+    lastButtonReading = digitalRead(buttonPin);
+    stableButtonState = lastButtonReading;
+
+    Serial.print("Botao configurado no GPIO ");
+    Serial.println(buttonPin);
+}
+
+void checkButton()
+{
+    bool reading = digitalRead(buttonPin);
+
+    if (reading != lastButtonReading)
+    {
+        lastDebounceTime = millis();
+    }
+
+    if ((millis() - lastDebounceTime) > debounceDelay)
+    {
+        if (reading != stableButtonState)
+        {
+            stableButtonState = reading;
+
+            if (stableButtonState == LOW)
+            {
+                Serial.println("Botao pressionado.");
+                takePhoto();
+            }
+        }
+    }
+
+    lastButtonReading = reading;
+}
+
+// ============================================================
+// PÁGINA WEB
+// ============================================================
+
+String htmlPage()
+{
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sony ESP32 Remote</title>
+
+<style>
+:root {
+    --bg: #05050a;
+    --card: #0d0d18;
+    --text: #d6f6ff;
+    --muted: #6d7a8a;
+    --cyan: #00fff2;
+    --magenta: #ff2079;
+    --purple: #9d4bff;
+    --yellow: #e8ff5c;
+    --danger: #ff2d55;
+    --border: #1c2333;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    font-family: "Courier New", Consolas, monospace;
+    background:
+        repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0px, rgba(255,255,255,0.025) 1px, transparent 1px, transparent 3px),
+        radial-gradient(circle at 50% 0%, #10102a 0%, var(--bg) 60%);
+    margin: 0;
+    padding: 16px;
+    color: var(--text);
+    min-height: 100vh;
+}
+
+.container {
+    max-width: 480px;
+    margin: auto;
+    background: var(--card);
+    padding: 20px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    box-shadow: 0 0 0 1px rgba(0,255,242,0.08), 0 0 30px rgba(157,75,255,0.18);
+    position: relative;
+    overflow: hidden;
+}
+
+.container::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--cyan), var(--purple), var(--magenta));
+}
+
+.eyebrow {
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--cyan);
+    text-shadow: 0 0 6px var(--cyan);
+    margin-bottom: 4px;
+}
+
+h1 {
+    font-size: 22px;
+    margin: 0 0 2px;
+    letter-spacing: 2px;
+    color: #ffffff;
+    text-shadow: 0 0 8px var(--magenta), 0 0 20px rgba(255,32,121,0.4);
+}
+
+.subtitle {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 16px;
+    letter-spacing: 1px;
+}
+
+h2 {
+    font-size: 12px;
+    margin: 24px 0 8px;
+    color: var(--purple);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    border-bottom: 1px dashed var(--border);
+    padding-bottom: 6px;
+}
+
+h2::before { content: "// "; color: var(--cyan); }
+
+.status-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #0a0a16;
+    padding: 14px 16px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    margin-top: 10px;
+}
+
+.status-left { display: flex; align-items: center; gap: 10px; }
+
+.dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: #444444;
+    transition: background .3s, box-shadow .3s;
+    flex-shrink: 0;
+}
+
+.dot.online {
+    background: var(--cyan);
+    box-shadow: 0 0 6px var(--cyan), 0 0 14px var(--cyan);
+    animation: pulse 1.6s infinite;
+}
+
+.dot.offline { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+
+.photo-count { font-size: 11px; color: var(--muted); text-align: right; letter-spacing: 1px; }
+.photo-count b { display: block; color: var(--yellow); font-size: 18px; text-shadow: 0 0 8px rgba(232,255,92,0.5); }
+
+label {
+    display: block;
+    margin-top: 12px;
+    font-size: 11px;
+    font-weight: bold;
+    color: var(--muted);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+
+input {
+    width: 100%;
+    padding: 10px;
+    margin-top: 4px;
+    background: #0a0a16;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 15px;
+    color: var(--cyan);
+    font-family: inherit;
+}
+
+input:focus {
+    outline: none;
+    border-color: var(--cyan);
+    box-shadow: 0 0 8px rgba(0,255,242,0.3);
+}
+
+button {
+    width: 100%;
+    padding: 13px;
+    margin-top: 12px;
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: bold;
+    cursor: pointer;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    font-family: inherit;
+    background: transparent;
+    transition: box-shadow .2s, transform .1s;
+}
+
+button:active { transform: scale(0.98); }
+button:disabled { opacity: .35; cursor: not-allowed; }
+
+.save { background: rgba(157,75,255,0.1); color: var(--purple); border: 1px solid var(--purple); }
+.save:hover:not(:disabled) { box-shadow: 0 0 12px rgba(157,75,255,0.5); }
+
+.photo { background: rgba(0,255,242,0.08); color: var(--cyan); border: 1px solid var(--cyan); font-size: 16px; padding: 16px; }
+.photo:hover:not(:disabled) { box-shadow: 0 0 16px rgba(0,255,242,0.5); }
+
+.connect { background: rgba(255,32,121,0.08); color: var(--magenta); border: 1px solid var(--magenta); }
+.connect:hover:not(:disabled) { box-shadow: 0 0 12px rgba(255,32,121,0.5); }
+
+.disconnect { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+
+.small { color: var(--muted); font-size: 11px; margin-top: 10px; text-align: center; }
+
+footer {
+    text-align: center;
+    margin-top: 22px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--border);
+    font-size: 11px;
+    letter-spacing: 1px;
+    color: var(--muted);
+}
+
+footer b { color: var(--cyan); text-shadow: 0 0 6px rgba(0,255,242,0.5); }
+
+.toast {
+    position: fixed;
+    left: 50%;
+    bottom: -60px;
+    transform: translateX(-50%);
+    background: #0d0d18;
+    color: var(--cyan);
+    border: 1px solid var(--cyan);
+    box-shadow: 0 0 16px rgba(0,255,242,0.3);
+    padding: 12px 20px;
+    border-radius: 4px;
+    font-size: 13px;
+    opacity: 0;
+    transition: bottom .3s, opacity .3s;
+    max-width: 90%;
+    text-align: center;
+    z-index: 100;
+    font-family: inherit;
+}
+
+.toast.show { bottom: 20px; opacity: 1; }
+.toast.error { color: var(--danger); border-color: var(--danger); box-shadow: 0 0 16px rgba(255,45,85,0.4); }
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<div class="eyebrow">&gt;&gt; REMOTE_SHUTTER_SYSTEM</div>
+<h1>SONY ZV-E10</h1>
+<div class="subtitle">controle remoto via ESP32 // link BLE</div>
+
+<div class="status-card">
+    <div class="status-left">
+        <span id="statusDot" class="dot offline"></span>
+        <span id="connectionStatus">Carregando...</span>
+    </div>
+    <div class="photo-count">
+        fotos
+        <b id="photoCount">0</b>
+    </div>
+</div>
+
+<h2>Controle</h2>
+
+<button id="btnPhoto" class="photo" onclick="takePhoto()" disabled>
+DISPARAR FOTO
+</button>
+
+<button id="btnConnect" class="connect" onclick="connectCamera()">
+CONECTAR À CÂMERA
+</button>
+
+<button class="disconnect" onclick="disconnectCamera()">
+DESCONECTAR
+</button>
+
+<p class="small">
+O botão físico dispara somente uma foto por pressionamento.
+</p>
+
+<h2>Configurações</h2>
+
+<form action="/save" method="POST">
+
+<label>GPIO do botão</label>
+<input type="number" name="buttonPin" min="0" max="39" value="%BUTTON_PIN%">
+
+<label>Tempo Half Down → Fully Down (ms)</label>
+<input type="number" name="halfDown" min="0" max="10000" value="%HALF_DOWN%">
+
+<label>Tempo Fully Down → Fully Up (ms)</label>
+<input type="number" name="fullDown" min="0" max="10000" value="%FULL_DOWN%">
+
+<label>Tempo Fully Up → Half Up (ms)</label>
+<input type="number" name="fullUp" min="0" max="10000" value="%FULL_UP%">
+
+<label>Debounce do botão (ms)</label>
+<input type="number" name="debounce" min="10" max="2000" value="%DEBOUNCE%">
+
+<label>Intervalo mínimo entre fotos (ms)</label>
+<input type="number" name="minShot" min="0" max="10000" value="%MIN_SHOT%">
+
+<button class="save" type="submit">
+Salvar configurações
+</button>
+
+</form>
+
+<footer>Criado por <b>Acioli Enterprises</b></footer>
+
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+let busy = false;
+let toastTimer = null;
+
+function showToast(msg, isError) {
+    const toast = document.getElementById('toast');
+    toast.textContent = msg;
+    toast.className = 'toast show' + (isError ? ' error' : '');
+
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+        toast.className = 'toast';
+    }, 3000);
+}
+
+async function takePhoto() {
+    if (busy) return;
+    busy = true;
+
+    try {
+        const r = await fetch('/photo', { method: 'POST' });
+        showToast(await r.text(), !r.ok);
+    } catch (e) {
+        showToast('Erro de comunicação com o ESP32', true);
+    }
+
+    busy = false;
+    updateStatus();
+}
+
+async function connectCamera() {
+    const btn = document.getElementById('btnConnect');
+    btn.disabled = true;
+    btn.textContent = 'CONECTANDO... (até 10s)';
+
+    try {
+        const r = await fetch('/connect', { method: 'POST' });
+        showToast(await r.text(), !r.ok);
+    } catch (e) {
+        showToast('Erro de comunicação com o ESP32', true);
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'CONECTAR À CÂMERA';
+    updateStatus();
+}
+
+async function disconnectCamera() {
+    try {
+        const r = await fetch('/disconnect', { method: 'POST' });
+        showToast(await r.text(), !r.ok);
+    } catch (e) {
+        showToast('Erro de comunicação com o ESP32', true);
+    }
+
+    updateStatus();
+}
+
+async function updateStatus() {
+    try {
+        const r = await fetch('/status');
+        const data = await r.json();
+
+        const dot = document.getElementById('statusDot');
+        const label = document.getElementById('connectionStatus');
+        const photoBtn = document.getElementById('btnPhoto');
+
+        dot.className = 'dot ' + (data.connected ? 'online' : 'offline');
+        label.textContent = data.connected ? 'Conectada' : 'Desconectada';
+        document.getElementById('photoCount').textContent = data.photos;
+
+        photoBtn.disabled = !data.connected || data.shooting || busy;
+        photoBtn.textContent = data.shooting ? 'DISPARANDO...' : 'DISPARAR FOTO';
+    } catch (e) {
+        // ESP32 fica ocupado durante o scan BLE (ate 10s); ignora falhas pontuais de status
+    }
+}
+
+setInterval(updateStatus, 1500);
+updateStatus();
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+    html.replace("%BUTTON_PIN%", String(buttonPin));
+    html.replace("%HALF_DOWN%", String(halfDownDelay));
+    html.replace("%FULL_DOWN%", String(fullDownDelay));
+    html.replace("%FULL_UP%", String(fullUpDelay));
+    html.replace("%DEBOUNCE%", String(debounceDelay));
+    html.replace("%MIN_SHOT%", String(minShotDelay));
+
+    return html;
+}
+
+// ============================================================
+// ROTAS WEB
+// ============================================================
+
+void handleRoot()
+{
+    server.send(200, "text/html; charset=utf-8", htmlPage());
+}
+
+void handleSave()
+{
+    if (server.hasArg("buttonPin"))
+        buttonPin = server.arg("buttonPin").toInt();
+
+    if (server.hasArg("halfDown"))
+        halfDownDelay = server.arg("halfDown").toInt();
+
+    if (server.hasArg("fullDown"))
+        fullDownDelay = server.arg("fullDown").toInt();
+
+    if (server.hasArg("fullUp"))
+        fullUpDelay = server.arg("fullUp").toInt();
+
+    if (server.hasArg("debounce"))
+        debounceDelay = server.arg("debounce").toInt();
+
+    if (server.hasArg("minShot"))
+        minShotDelay = server.arg("minShot").toInt();
+
+    if (buttonPin < 0 || buttonPin > 39)
+        buttonPin = DEFAULT_BUTTON_PIN;
+
+    if (halfDownDelay > 10000)
+        halfDownDelay = DEFAULT_HALF_DOWN_DELAY;
+
+    if (fullDownDelay > 10000)
+        fullDownDelay = DEFAULT_FULL_DOWN_DELAY;
+
+    if (fullUpDelay > 10000)
+        fullUpDelay = DEFAULT_FULL_UP_DELAY;
+
+    if (debounceDelay < 10 || debounceDelay > 2000)
+        debounceDelay = DEFAULT_DEBOUNCE_DELAY;
+
+    if (minShotDelay > 10000)
+        minShotDelay = DEFAULT_MIN_SHOT_DELAY;
+
+    saveSettings();
+    configureButtonPin();
+
+    server.sendHeader("Location", "/");
+    server.send(303);
+}
+
+void handlePhoto()
+{
+    if (shooting)
+    {
+        server.send(409, "text/plain; charset=utf-8", "Disparo ignorado: outra sequência está em andamento.");
+        return;
+    }
+
+    if (!connected)
+    {
+        server.send(503, "text/plain; charset=utf-8", "Câmera não conectada.");
+        return;
+    }
+
+    takePhoto();
+
+    server.send(200, "text/plain; charset=utf-8", "Disparo concluído.");
+}
+
+void handleConnect()
+{
+    bool result = connectToCamera();
+
+    if (result)
+    {
+        server.send(200, "text/plain; charset=utf-8", "Câmera conectada.");
+    }
+    else
+    {
+        server.send(500, "text/plain; charset=utf-8", "Não foi possível conectar à câmera.");
+    }
+}
+
+void handleDisconnect()
+{
+    disconnectFromCamera();
+    server.send(200, "text/plain; charset=utf-8", "Câmera desconectada.");
+}
+
+void handleStatus()
+{
+    String json = "{";
+    json += "\"connected\":";
+    json += connected ? "true" : "false";
+    json += ",\"shooting\":";
+    json += shooting ? "true" : "false";
+    json += ",\"photos\":";
+    json += String(photoCount);
+    json += "}";
+
+    server.send(200, "application/json; charset=utf-8", json);
+}
+
+// Qualquer URL desconhecida redireciona para "/".
+// É o truque padrão que faz Android/iOS/Windows abrirem
+// a página de login automaticamente ao entrar no Wi-Fi do ESP32.
+void handleNotFound()
+{
+    server.sendHeader("Location", "/", true);
+    server.send(302, "text/plain", "");
+}
+
+// ============================================================
+// CONFIGURAR WI-FI, DNS E SERVIDOR
+// ============================================================
+
+void setupWebServer()
+{
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+    // Reduz interferencia do Wi-Fi no radio compartilhado com o BLE
+    WiFi.setSleep(false);
+
+    IPAddress apIP = WiFi.softAPIP();
+
+    dnsServer.start(DNS_PORT, "*", apIP);
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("WI-FI CONFIGURADO");
+    Serial.print("Rede: ");
+    Serial.println(AP_SSID);
+    Serial.print("IP: ");
+    Serial.println(apIP);
+    Serial.println("========================================");
+
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/save", HTTP_POST, handleSave);
+    server.on("/photo", HTTP_POST, handlePhoto);
+    server.on("/connect", HTTP_POST, handleConnect);
+    server.on("/disconnect", HTTP_POST, handleDisconnect);
+    server.on("/status", HTTP_GET, handleStatus);
+    server.onNotFound(handleNotFound);
+
+    server.begin();
+
+    Serial.println("Servidor web iniciado.");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+    // Endereco Bluetooth novo: a camera guardou uma chave antiga para o
+    // endereco original e recusa a autenticacao. Com outro endereco ela
+    // ve um controle remoto novo e pareia do zero.
+    // (precisa vir antes de iniciar Bluetooth e Wi-Fi)
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+    mac[0] |= 0x02;     // endereco "administrado localmente", diferente do de fabrica
+    esp_base_mac_addr_set(mac);
+
+    delay(1000);
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("SONY ZV-E10 - ESP32 REMOTE V7");
+    Serial.println("========================================");
+
+    loadSettings();
+    configureButtonPin();
+
+    BLEDevice::init("");
+    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
+    BLEDevice::setSecurityCallbacks(new MySecurity());
+
+    setupWebServer();
+
+    connectToCamera();
+
+    Serial.println();
+    Serial.println("Comandos seriais:");
+    Serial.println("F = disparar foto");
+    Serial.println("C = conectar");
+    Serial.println("D = desconectar");
+    Serial.println("========================================");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+    dnsServer.processNextRequest();
+    server.handleClient();
+
+    checkButton();
+
+    if (Serial.available())
+    {
+        char command = Serial.read();
+
+        if (command == 'F' || command == 'f')
+        {
+            takePhoto();
+        }
+        else if (command == 'C' || command == 'c')
+        {
+            connectToCamera();
+        }
+        else if (command == 'D' || command == 'd')
+        {
+            disconnectFromCamera();
+        }
+    }
+
+    delay(5);
+}

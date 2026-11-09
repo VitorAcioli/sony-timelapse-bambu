@@ -1,0 +1,1865 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <WiFiClientSecure.h>
+
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLESecurity.h>
+
+#include "esp_bt.h"
+
+// ============================================================
+// CONFIGURAÇÕES PADRÃO
+// ============================================================
+
+#define CAMERA_NAME "ZV-E10"
+
+#define DEFAULT_BUTTON_PIN 27
+
+#define DEFAULT_HALF_DOWN_DELAY 250
+#define DEFAULT_FULL_DOWN_DELAY 250
+#define DEFAULT_FULL_UP_DELAY   250
+#define DEFAULT_DEBOUNCE_DELAY   50
+#define DEFAULT_MIN_SHOT_DELAY  300
+
+// ============================================================
+// BAMBU LAB A1 (MQTT LOCAL)
+// ============================================================
+//
+// A impressora expoe um broker MQTT sobre TLS na rede local:
+//   porta 8883, usuario "bblp", senha = Access Code (tela da impressora)
+//   topico de status:  device/<SERIAL>/report
+//   topico de comando: device/<SERIAL>/request
+//
+// O campo print.layer_num muda a cada camada -> disparamos a camera.
+
+#define BAMBU_MQTT_PORT 8883
+#define BAMBU_MQTT_USER "bblp"
+
+// Memoria e apertada (Bluetooth + Wi-Fi + TLS). As mensagens de status
+// incrementais da A1 sao pequenas; o relatorio completo (pushall) pode
+// nao caber e e descartado com seguranca (PubSubClient corrigido em lib/).
+#define MQTT_BUFFER_SIZE 4096
+
+// O TLS precisa de 2 blocos CONTIGUOS de ~16,7 KB. Com o Bluetooth
+// ligado a memoria fragmenta e o maior bloco cai para ~30 KB.
+// Reservamos um bloco no boot (antes do Bluetooth) e so liberamos
+// na etapa 2, logo antes de conectar na impressora.
+#define TLS_RESERVE_SIZE 36864
+
+// Etapa 1: tenta a camera de novo a cada X ms ate conectar
+#define CAMERA_RETRY_INTERVAL 30000
+
+#define MQTT_RECONNECT_INTERVAL 10000
+#define DEFAULT_LAYER_SHOT_DELAY 500
+
+// ============================================================
+// UUIDs Sony
+// ============================================================
+
+#define SONY_SERVICE_UUID "8000ff00-ff00-ffff-ffff-ffffffffffff"
+#define SONY_COMMAND_UUID "0000ff01-0000-1000-8000-00805f9b34fb"
+#define SONY_NOTIFY_UUID  "0000ff02-0000-1000-8000-00805f9b34fb"
+
+// ============================================================
+// WI-FI + PORTAL CATIVO
+// ============================================================
+
+const char* AP_SSID = "Sony-ESP32";
+const char* AP_PASSWORD = "12345678";
+
+const byte DNS_PORT = 53;
+
+WebServer server(80);
+DNSServer dnsServer;
+
+// ============================================================
+// MEMÓRIA
+// ============================================================
+
+Preferences preferences;
+
+// ============================================================
+// CONFIGURAÇÕES EDITÁVEIS
+// ============================================================
+
+int buttonPin = DEFAULT_BUTTON_PIN;
+
+unsigned long halfDownDelay = DEFAULT_HALF_DOWN_DELAY;
+unsigned long fullDownDelay = DEFAULT_FULL_DOWN_DELAY;
+unsigned long fullUpDelay   = DEFAULT_FULL_UP_DELAY;
+
+unsigned long debounceDelay = DEFAULT_DEBOUNCE_DELAY;
+unsigned long minShotDelay = DEFAULT_MIN_SHOT_DELAY;
+
+// Impressora
+bool printerEnabled = false;
+
+String wifiSsid = "";
+String wifiPass = "";
+
+String printerIp = "";
+String printerSerial = "";
+String printerAccessCode = "";
+
+unsigned long layerShotDelay = DEFAULT_LAYER_SHOT_DELAY;
+
+// ============================================================
+// STATUS
+// ============================================================
+
+BLEClient* pClient = nullptr;
+
+BLERemoteCharacteristic* pCommandCharacteristic = nullptr;
+BLERemoteCharacteristic* pNotifyCharacteristic = nullptr;
+
+bool connected = false;
+bool paired = false;
+bool shooting = false;
+
+unsigned long lastShotTime = 0;
+unsigned long photoCount = 0;
+
+// ============================================================
+// STATUS DA IMPRESSORA
+// ============================================================
+
+WiFiClientSecure mqttNet;
+PubSubClient mqtt(mqttNet);
+
+String printerState = "";      // gcode_state: IDLE, PREPARE, RUNNING, PAUSE, FINISH, FAILED
+int printerLayer = -1;         // -1 = ainda nao recebido
+int printerTotalLayers = 0;
+int printerPercent = -1;
+
+unsigned long layerShots = 0;
+
+bool layerShotPending = false;
+unsigned long layerShotPendingSince = 0;
+
+unsigned long lastMqttAttempt = 0;
+bool mqttEverTried = false;
+bool mqttWasConnected = false;
+
+void* tlsReserve = nullptr;
+
+// Etapas: 1 = camera, 2 = impressora (so comeca depois da camera pronta)
+bool printerStageStarted = false;
+unsigned long lastCameraAttempt = 0;
+
+// ============================================================
+// BOTÃO
+// ============================================================
+
+bool lastButtonReading = HIGH;
+bool stableButtonState = HIGH;
+
+unsigned long lastDebounceTime = 0;
+
+// ============================================================
+// SEGURANÇA BLE
+// ============================================================
+
+class MySecurity : public BLESecurityCallbacks
+{
+    uint32_t onPassKeyRequest()
+    {
+        Serial.println("Solicitacao de PIN");
+        return 133700;
+    }
+
+    void onPassKeyNotify(uint32_t pass_key)
+    {
+        Serial.print("PIN recebido: ");
+        Serial.println(pass_key);
+    }
+
+    bool onConfirmPIN(uint32_t pass_key)
+    {
+        Serial.print("Confirmando PIN: ");
+        Serial.println(pass_key);
+        return true;
+    }
+
+    bool onSecurityRequest()
+    {
+        Serial.println("Solicitacao de seguranca");
+        return true;
+    }
+
+    void onAuthenticationComplete(esp_ble_auth_cmpl_t auth_cmpl)
+    {
+        if (auth_cmpl.success)
+        {
+            Serial.println("Autenticacao BLE concluida.");
+            paired = true;
+        }
+        else
+        {
+            Serial.println("Falha na autenticacao BLE.");
+            paired = false;
+        }
+    }
+};
+
+// ============================================================
+// CALLBACKS DE CONEXÃO BLE
+// (detecta quando a câmera cai sozinha, ex: dormiu ou saiu de alcance)
+// ============================================================
+
+class MyClientCallback : public BLEClientCallbacks
+{
+    void onConnect(BLEClient* client) {}
+
+    void onDisconnect(BLEClient* client)
+    {
+        connected = false;
+        paired = false;
+
+        pCommandCharacteristic = nullptr;
+        pNotifyCharacteristic = nullptr;
+
+        Serial.println("Camera desconectou (evento BLE).");
+    }
+};
+
+// ============================================================
+// NOTIFICAÇÕES DA SONY
+// ============================================================
+
+void notifyCallback(
+    BLERemoteCharacteristic* characteristic,
+    uint8_t* data,
+    size_t length,
+    bool isNotify)
+{
+    Serial.println();
+    Serial.println("----------------------------------------");
+    Serial.println("RESPOSTA DA ZV-E10 - FF02");
+    Serial.print("HEX: ");
+
+    for (size_t i = 0; i < length; i++)
+    {
+        if (data[i] < 0x10)
+            Serial.print("0");
+
+        Serial.print(data[i], HEX);
+        Serial.print(" ");
+    }
+
+    Serial.println();
+    Serial.println("----------------------------------------");
+}
+
+// ============================================================
+// SALVAR / CARREGAR CONFIGURAÇÕES
+// ============================================================
+
+void saveSettings()
+{
+    preferences.begin("sonyremote", false);
+
+    preferences.putInt("buttonPin", buttonPin);
+
+    preferences.putULong("halfDown", halfDownDelay);
+    preferences.putULong("fullDown", fullDownDelay);
+    preferences.putULong("fullUp", fullUpDelay);
+
+    preferences.putULong("debounce", debounceDelay);
+    preferences.putULong("minShot", minShotDelay);
+
+    preferences.putBool("prnEnabled", printerEnabled);
+    preferences.putString("wifiSsid", wifiSsid);
+    preferences.putString("wifiPass", wifiPass);
+    preferences.putString("prnIp", printerIp);
+    preferences.putString("prnSerial", printerSerial);
+    preferences.putString("prnCode", printerAccessCode);
+    preferences.putULong("layerDelay", layerShotDelay);
+
+    preferences.end();
+
+    Serial.println("Configuracoes salvas.");
+}
+
+void loadSettings()
+{
+    preferences.begin("sonyremote", true);
+
+    buttonPin = preferences.getInt("buttonPin", DEFAULT_BUTTON_PIN);
+
+    halfDownDelay = preferences.getULong("halfDown", DEFAULT_HALF_DOWN_DELAY);
+    fullDownDelay = preferences.getULong("fullDown", DEFAULT_FULL_DOWN_DELAY);
+    fullUpDelay   = preferences.getULong("fullUp", DEFAULT_FULL_UP_DELAY);
+
+    debounceDelay = preferences.getULong("debounce", DEFAULT_DEBOUNCE_DELAY);
+    minShotDelay  = preferences.getULong("minShot", DEFAULT_MIN_SHOT_DELAY);
+
+    printerEnabled    = preferences.getBool("prnEnabled", false);
+    // isKey() evita o log de erro "NOT_FOUND" na primeira execucao
+    auto getStr = [](const char* key) -> String {
+        return preferences.isKey(key) ? preferences.getString(key, "") : String("");
+    };
+
+    wifiSsid          = getStr("wifiSsid");
+    wifiPass          = getStr("wifiPass");
+    printerIp         = getStr("prnIp");
+    printerSerial     = getStr("prnSerial");
+    printerAccessCode = getStr("prnCode");
+    layerShotDelay    = preferences.getULong("layerDelay", DEFAULT_LAYER_SHOT_DELAY);
+
+    preferences.end();
+
+    Serial.println("Configuracoes carregadas.");
+}
+
+// ============================================================
+// CONECTAR À CAMERA
+// ============================================================
+
+bool connectToCamera()
+{
+    if (connected)
+    {
+        Serial.println("Camera ja esta conectada.");
+        return true;
+    }
+
+    Serial.println();
+    Serial.println("Procurando ZV-E10...");
+
+    BLEScan* pScan = BLEDevice::getScan();
+
+    pScan->setActiveScan(true);
+
+    BLEScanResults results = pScan->start(10, false);
+
+    BLEAdvertisedDevice* cameraDevice = nullptr;
+
+    for (int i = 0; i < results.getCount(); i++)
+    {
+        BLEAdvertisedDevice device = results.getDevice(i);
+
+        String name = device.getName().c_str();
+
+        Serial.print("Dispositivo: ");
+        Serial.println(name);
+
+        if (name.indexOf(CAMERA_NAME) >= 0)
+        {
+            Serial.println("ZV-E10 encontrada!");
+
+            cameraDevice = new BLEAdvertisedDevice(device);
+            break;
+        }
+    }
+
+    // Libera a memoria dos resultados do scan (evita acumulo a cada reconexao)
+    pScan->clearResults();
+
+    if (cameraDevice == nullptr)
+    {
+        Serial.println("Camera nao encontrada.");
+        return false;
+    }
+
+    Serial.println("Conectando...");
+
+    pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new MyClientCallback());
+
+    bool ok = pClient->connect(cameraDevice);
+
+    // connect() ja copia o endereco internamente, o ponteiro pode ser liberado
+    delete cameraDevice;
+
+    if (!ok)
+    {
+        Serial.println("Falha ao conectar.");
+        return false;
+    }
+
+    Serial.println("Conectado à camera.");
+
+    BLERemoteService* pService =
+        pClient->getService(BLEUUID(SONY_SERVICE_UUID));
+
+    if (pService == nullptr)
+    {
+        Serial.println("Servico Sony nao encontrado.");
+        pClient->disconnect();
+        return false;
+    }
+
+    pCommandCharacteristic =
+        pService->getCharacteristic(BLEUUID(SONY_COMMAND_UUID));
+
+    pNotifyCharacteristic =
+        pService->getCharacteristic(BLEUUID(SONY_NOTIFY_UUID));
+
+    if (pCommandCharacteristic == nullptr)
+    {
+        Serial.println("Caracteristica FF01 nao encontrada.");
+        pClient->disconnect();
+        return false;
+    }
+
+    if (pNotifyCharacteristic != nullptr && pNotifyCharacteristic->canNotify())
+    {
+        pNotifyCharacteristic->registerForNotify(notifyCallback);
+        Serial.println("FF02 configurado.");
+    }
+
+    connected = true;
+
+    Serial.println("Camera pronta.");
+
+    return true;
+}
+
+// ============================================================
+// DESCONECTAR DA CAMERA
+// ============================================================
+
+void disconnectFromCamera()
+{
+    if (pClient != nullptr && connected)
+    {
+        pClient->disconnect();
+    }
+
+    connected = false;
+    paired = false;
+
+    pCommandCharacteristic = nullptr;
+    pNotifyCharacteristic = nullptr;
+
+    Serial.println("Camera desconectada.");
+}
+
+// ============================================================
+// DISPARO DA CAMERA
+// ============================================================
+
+// Envia um comando e confirma que a camera ainda esta conectada antes disso.
+// Retorna false se a sequencia deve ser abortada.
+bool sendShutterCommand(const uint8_t* cmd, size_t len, const char* label)
+{
+    if (!connected || pCommandCharacteristic == nullptr)
+    {
+        Serial.print("Sequencia abortada antes de enviar: ");
+        Serial.println(label);
+        return false;
+    }
+
+    Serial.print("Enviando ");
+    Serial.println(label);
+
+    pCommandCharacteristic->writeValue((uint8_t*)cmd, len, true);
+
+    return true;
+}
+
+void takePhoto()
+{
+    if (shooting)
+    {
+        Serial.println("Disparo ignorado: sequencia em andamento.");
+        return;
+    }
+
+    if (!connected || pCommandCharacteristic == nullptr)
+    {
+        Serial.println("Camera nao conectada.");
+        return;
+    }
+
+    if (millis() - lastShotTime < minShotDelay)
+    {
+        Serial.println("Disparo ignorado: intervalo minimo ainda nao terminou.");
+        return;
+    }
+
+    shooting = true;
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("DISPARANDO FOTO");
+    Serial.println("========================================");
+
+    bool ok = true;
+
+    uint8_t halfDown[] = {0x01, 0x07};
+    ok = sendShutterCommand(halfDown, sizeof(halfDown), "Shutter Half Down: 01 07");
+    if (ok) delay(halfDownDelay);
+
+    uint8_t fullyDown[] = {0x01, 0x09};
+    if (ok) ok = sendShutterCommand(fullyDown, sizeof(fullyDown), "Shutter Fully Down: 01 09");
+    if (ok) delay(fullDownDelay);
+
+    uint8_t fullyUp[] = {0x01, 0x08};
+    if (ok) ok = sendShutterCommand(fullyUp, sizeof(fullyUp), "Shutter Fully Up: 01 08");
+    if (ok) delay(fullUpDelay);
+
+    uint8_t halfUp[] = {0x01, 0x06};
+    if (ok) ok = sendShutterCommand(halfUp, sizeof(halfUp), "Shutter Half Up: 01 06");
+
+    if (ok)
+    {
+        photoCount++;
+        lastShotTime = millis();
+
+        Serial.println("Foto concluida.");
+        Serial.print("Total de fotos: ");
+        Serial.println(photoCount);
+    }
+    else
+    {
+        Serial.println("Sequencia de disparo interrompida (camera desconectou no meio do processo).");
+    }
+
+    shooting = false;
+
+    Serial.println("========================================");
+}
+
+// ============================================================
+// BOTÃO
+// ============================================================
+
+void configureButtonPin()
+{
+    pinMode(buttonPin, INPUT_PULLUP);
+
+    lastButtonReading = digitalRead(buttonPin);
+    stableButtonState = lastButtonReading;
+
+    Serial.print("Botao configurado no GPIO ");
+    Serial.println(buttonPin);
+}
+
+void checkButton()
+{
+    bool reading = digitalRead(buttonPin);
+
+    if (reading != lastButtonReading)
+    {
+        lastDebounceTime = millis();
+    }
+
+    if ((millis() - lastDebounceTime) > debounceDelay)
+    {
+        if (reading != stableButtonState)
+        {
+            stableButtonState = reading;
+
+            if (stableButtonState == LOW)
+            {
+                Serial.println("Botao pressionado.");
+                takePhoto();
+            }
+        }
+    }
+
+    lastButtonReading = reading;
+}
+
+// ============================================================
+// BAMBU LAB A1 - WI-FI (MODO ESTACAO)
+// ============================================================
+
+bool printerConfigured()
+{
+    return printerEnabled &&
+           wifiSsid.length() > 0 &&
+           printerIp.length() > 0 &&
+           printerSerial.length() > 0 &&
+           printerAccessCode.length() > 0;
+}
+
+void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    switch (event)
+    {
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.print("Wi-Fi: conectado, IP ");
+            Serial.println(WiFi.localIP());
+            break;
+
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            Serial.print("Wi-Fi: desconectado (motivo ");
+            Serial.print(info.wifi_sta_disconnected.reason);
+            Serial.println(") - 201=rede nao encontrada, 15/202=senha errada");
+            break;
+
+        default:
+            break;
+    }
+}
+
+void startStation()
+{
+    if (!printerEnabled || wifiSsid.length() == 0)
+    {
+        // Sem impressora: so o AP (portal), como antes.
+        // O modem sleep fica ligado (seguro em qualquer modo).
+        if (WiFi.getMode() == WIFI_AP_STA)
+        {
+            WiFi.disconnect(false);
+            WiFi.mode(WIFI_AP);
+        }
+        return;
+    }
+
+    Serial.print("Wi-Fi: conectando a rede ");
+    Serial.println(wifiSsid);
+
+    // Com interface de estacao + BLE o ESP32 EXIGE modem sleep ligado
+    // (senao: "Should enable WiFi modem sleep..." e abort).
+    // Precisa ser ligado ANTES de criar a interface de estacao.
+    WiFi.setSleep(true);
+    WiFi.mode(WIFI_AP_STA);
+
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+}
+
+// ============================================================
+// BAMBU LAB A1 - MQTT
+// ============================================================
+
+// ============================================================
+// RESERVA DE MEMORIA PARA O TLS
+// ============================================================
+
+void takeTlsReserve()
+{
+    if (tlsReserve != nullptr)
+        return;
+
+    tlsReserve = malloc(TLS_RESERVE_SIZE);
+
+    if (tlsReserve != nullptr)
+    {
+        Serial.print("TLS: reservados ");
+        Serial.print(TLS_RESERVE_SIZE);
+        Serial.println(" bytes contiguos para a impressora.");
+    }
+    else
+    {
+        Serial.println("TLS: nao foi possivel reservar memoria (heap fragmentado).");
+    }
+}
+
+void releaseTlsReserve()
+{
+    if (tlsReserve != nullptr)
+    {
+        free(tlsReserve);
+        tlsReserve = nullptr;
+    }
+}
+
+// ============================================================
+// ETAPAS: 1 = CAMERA, 2 = IMPRESSORA
+// ============================================================
+
+void startPrinterStage()
+{
+    printerStageStarted = true;
+
+    Serial.println();
+    Serial.println(">>> ETAPA 1 concluida: camera pronta.");
+
+    if (!printerEnabled)
+    {
+        Serial.println(">>> ETAPA 2 ignorada: impressora desativada no portal.");
+        releaseTlsReserve();
+        return;
+    }
+
+    Serial.println(">>> ETAPA 2: conectando a impressora...");
+    startStation();
+}
+
+void stageLoop()
+{
+    if (printerStageStarted)
+        return;
+
+    if (connected)
+    {
+        startPrinterStage();
+        return;
+    }
+
+    // Camera ainda nao conectou: tenta de novo periodicamente
+    if (millis() - lastCameraAttempt > CAMERA_RETRY_INTERVAL)
+    {
+        lastCameraAttempt = millis();
+
+        Serial.println();
+        Serial.println(">>> ETAPA 1: nova tentativa de conectar a camera...");
+
+        connectToCamera();
+    }
+}
+
+void handlePrinterLayer(int layer)
+{
+    if (layer == printerLayer)
+        return;
+
+    int previous = printerLayer;
+    printerLayer = layer;
+
+    Serial.print("Impressora: camada ");
+    Serial.print(layer);
+    Serial.print("/");
+    Serial.println(printerTotalLayers);
+
+    // Primeira leitura (acabou de conectar): so registra
+    if (previous < 0)
+        return;
+
+    // Camada voltou (nova impressao comecando): so registra
+    if (layer <= previous)
+        return;
+
+    // Estado vazio = ainda nao recebemos gcode_state (conectou no meio da
+    // impressao e o pushall nao chegou); nesse caso confiamos na camada.
+    if (printerState != "RUNNING" && printerState.length() > 0)
+        return;
+
+    layerShotPending = true;
+    layerShotPendingSince = millis();
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length)
+{
+    // Filtro: so desserializa os campos usados (economiza muita RAM)
+    JsonDocument filter;
+    filter["print"]["gcode_state"] = true;
+    filter["print"]["layer_num"] = true;
+    filter["print"]["total_layer_num"] = true;
+    filter["print"]["mc_percent"] = true;
+
+    JsonDocument doc;
+
+    DeserializationError err = deserializeJson(
+        doc, payload, length, DeserializationOption::Filter(filter));
+
+    if (err)
+    {
+        Serial.print("MQTT: JSON invalido: ");
+        Serial.println(err.c_str());
+        return;
+    }
+
+    JsonObject print = doc["print"];
+
+    if (print.isNull())
+        return;
+
+    if (print["gcode_state"].is<const char*>())
+    {
+        String newState = print["gcode_state"].as<const char*>();
+
+        if (newState != printerState)
+        {
+            Serial.print("Impressora: estado ");
+            Serial.print(printerState.length() ? printerState : "?");
+            Serial.print(" -> ");
+            Serial.println(newState);
+
+            printerState = newState;
+        }
+    }
+
+    if (print["total_layer_num"].is<int>())
+        printerTotalLayers = print["total_layer_num"].as<int>();
+
+    if (print["mc_percent"].is<int>())
+        printerPercent = print["mc_percent"].as<int>();
+
+    if (print["layer_num"].is<int>())
+        handlePrinterLayer(print["layer_num"].as<int>());
+}
+
+void requestPrinterPushAll()
+{
+    String topic = "device/" + printerSerial + "/request";
+
+    mqtt.publish(topic.c_str(),
+                 "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"pushall\"}}");
+}
+
+bool connectPrinter()
+{
+    lastMqttAttempt = millis();
+    mqttEverTried = true;
+
+    IPAddress ip;
+
+    if (!ip.fromString(printerIp))
+    {
+        Serial.println("MQTT: IP da impressora invalido.");
+        return false;
+    }
+
+    Serial.print("MQTT: conectando a impressora em ");
+    Serial.print(printerIp);
+    Serial.println(":8883 ...");
+
+    // A impressora usa certificado autoassinado
+    mqttNet.setInsecure();
+
+    mqtt.setServer(ip, BAMBU_MQTT_PORT);
+
+    String clientId = "sony-esp32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    // Etapa 2: devolve o bloco reservado no boot; o TLS aloca seus buffers nele
+    releaseTlsReserve();
+
+    Serial.print("MQTT: heap livre antes do TLS: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.print(" (maior bloco: ");
+    Serial.print(ESP.getMaxAllocHeap());
+    Serial.println(")");
+
+    // ---- Passo A: conexao TLS (separada, para saber onde trava) ----
+    // Padrao da biblioteca e 120 s. Medido: 10-16 s neste ESP32 (Wi-Fi
+    // dividindo o radio com o BLE), entao 15 s era pouco; usamos 30 s.
+    mqttNet.setHandshakeTimeout(30);
+
+    Serial.println("TLS: abrindo conexao segura com a impressora...");
+
+    unsigned long tlsStart = millis();
+
+    if (!mqttNet.connect(ip, BAMBU_MQTT_PORT))
+    {
+        Serial.print("TLS: falhou apos ");
+        Serial.print(millis() - tlsStart);
+        Serial.println(" ms (porta 8883 fechada, IP errado ou impressora nao respondeu ao handshake).");
+
+        char tlsError[128];
+        int tlsCode = mqttNet.lastError(tlsError, sizeof(tlsError));
+        Serial.print("TLS: erro ");
+        Serial.print(tlsCode);
+        Serial.print(" - ");
+        Serial.println(tlsError);
+
+        mqttNet.stop();
+        takeTlsReserve();
+        return false;
+    }
+
+    Serial.print("TLS: conectado em ");
+    Serial.print(millis() - tlsStart);
+    Serial.println(" ms. Enviando login MQTT...");
+
+    // ---- Passo B: login MQTT (reaproveita a conexao TLS ja aberta) ----
+    unsigned long connectStart = millis();
+
+    bool mqttOk = mqtt.connect(clientId.c_str(), BAMBU_MQTT_USER, printerAccessCode.c_str());
+
+    Serial.print("MQTT: resposta do login em ");
+    Serial.print(millis() - connectStart);
+    Serial.println(" ms");
+
+    if (!mqttOk)
+    {
+        int code = mqtt.state();
+
+        Serial.print("MQTT: falha ao conectar (codigo ");
+        Serial.print(code);
+        Serial.print(") -> ");
+
+        switch (code)
+        {
+            case -4: Serial.println("timeout esperando resposta da impressora (feche o Bambu Studio/Handy e confira o Developer Mode)."); break;
+            case -2: Serial.println("conexao TCP/TLS falhou (IP errado, impressora fora do modo LAN, ou falta de memoria)."); break;
+            case 4:  Serial.println("usuario/senha recusados -> Access Code errado."); break;
+            case 5:  Serial.println("nao autorizado -> Access Code errado ou modo LAN/Developer desligado."); break;
+            default: Serial.println("veja a tabela de codigos do PubSubClient."); break;
+        }
+
+        char tlsError[128];
+        int tlsCode = mqttNet.lastError(tlsError, sizeof(tlsError));
+
+        if (tlsCode != 0)
+        {
+            Serial.print("TLS: erro ");
+            Serial.print(tlsCode);
+            Serial.print(" - ");
+            Serial.println(tlsError);
+        }
+
+        // Libera os buffers do TLS e guarda o espaco para a proxima tentativa
+        mqttNet.stop();
+        takeTlsReserve();
+        return false;
+    }
+
+    String topic = "device/" + printerSerial + "/report";
+
+    if (!mqtt.subscribe(topic.c_str()))
+    {
+        Serial.println("MQTT: falha ao assinar o topico (serial correto?).");
+        mqtt.disconnect();
+        mqttNet.stop();
+        takeTlsReserve();
+        return false;
+    }
+
+    mqttWasConnected = true;
+
+    // Recomeca o acompanhamento de camadas
+    printerLayer = -1;
+    layerShotPending = false;
+
+    requestPrinterPushAll();
+
+    Serial.println("MQTT: conectado a impressora.");
+    Serial.print("Heap livre: ");
+    Serial.println(ESP.getFreeHeap());
+
+    return true;
+}
+
+void restartPrinterConnection()
+{
+    if (mqtt.connected())
+        mqtt.disconnect();
+
+    mqttNet.stop();
+    mqttWasConnected = false;
+
+    printerState = "";
+    printerLayer = -1;
+    printerTotalLayers = 0;
+    printerPercent = -1;
+    layerShotPending = false;
+    mqttEverTried = false;
+
+    if (printerEnabled)
+        takeTlsReserve();
+    else
+        releaseTlsReserve();
+
+    // Na etapa 1 a rede da impressora ainda nao entra (camera primeiro)
+    if (printerStageStarted)
+        startStation();
+}
+
+void printerLoop()
+{
+    // Disparo agendado por troca de camada (mesmo se o MQTT cair logo depois)
+    if (layerShotPending && millis() - layerShotPendingSince >= layerShotDelay)
+    {
+        layerShotPending = false;
+
+        Serial.println("Troca de camada -> disparando camera.");
+
+        unsigned long before = photoCount;
+        takePhoto();
+
+        if (photoCount > before)
+            layerShots++;
+    }
+
+    // Etapa 2 so comeca depois que a camera conectou
+    if (!printerStageStarted)
+        return;
+
+    if (!printerConfigured())
+    {
+        // Avisa uma vez por que o MQTT nao vai tentar conectar
+        static bool warned = false;
+
+        if (printerEnabled && !warned)
+        {
+            warned = true;
+            Serial.print("MQTT: configuracao incompleta, faltando:");
+            if (wifiSsid.length() == 0)          Serial.print(" [rede Wi-Fi]");
+            if (printerIp.length() == 0)         Serial.print(" [IP]");
+            if (printerSerial.length() == 0)     Serial.print(" [numero de serie]");
+            if (printerAccessCode.length() == 0) Serial.print(" [Access Code]");
+            Serial.println(" -> preencha no portal e salve.");
+        }
+        return;
+    }
+
+    if (WiFi.status() != WL_CONNECTED)
+        return;   // auto-reconnect do Wi-Fi cuida disso
+
+    if (!mqtt.connected())
+    {
+        // Caiu depois de conectado: libera os buffers do TLS
+        if (mqttWasConnected)
+        {
+            mqttWasConnected = false;
+            Serial.println("MQTT: conexao com a impressora perdida.");
+            mqttNet.stop();
+            takeTlsReserve();
+        }
+
+        if (!mqttEverTried || millis() - lastMqttAttempt > MQTT_RECONNECT_INTERVAL)
+            connectPrinter();
+
+        return;
+    }
+
+    mqtt.loop();
+}
+
+// ============================================================
+// PÁGINA WEB
+// ============================================================
+
+String htmlEscape(const String& s)
+{
+    String out;
+    out.reserve(s.length());
+
+    for (unsigned int i = 0; i < s.length(); i++)
+    {
+        char c = s[i];
+
+        switch (c)
+        {
+            case '&':  out += "&amp;";  break;
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&#39;";  break;
+            default:   out += c;
+        }
+    }
+
+    return out;
+}
+
+String htmlPage()
+{
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sony ESP32 Remote</title>
+
+<style>
+:root {
+    --bg: #05050a;
+    --card: #0d0d18;
+    --text: #d6f6ff;
+    --muted: #6d7a8a;
+    --cyan: #00fff2;
+    --magenta: #ff2079;
+    --purple: #9d4bff;
+    --yellow: #e8ff5c;
+    --danger: #ff2d55;
+    --border: #1c2333;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    font-family: "Courier New", Consolas, monospace;
+    background:
+        repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0px, rgba(255,255,255,0.025) 1px, transparent 1px, transparent 3px),
+        radial-gradient(circle at 50% 0%, #10102a 0%, var(--bg) 60%);
+    margin: 0;
+    padding: 16px;
+    color: var(--text);
+    min-height: 100vh;
+}
+
+.container {
+    max-width: 480px;
+    margin: auto;
+    background: var(--card);
+    padding: 20px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    box-shadow: 0 0 0 1px rgba(0,255,242,0.08), 0 0 30px rgba(157,75,255,0.18);
+    position: relative;
+    overflow: hidden;
+}
+
+.container::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--cyan), var(--purple), var(--magenta));
+}
+
+.eyebrow {
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--cyan);
+    text-shadow: 0 0 6px var(--cyan);
+    margin-bottom: 4px;
+}
+
+h1 {
+    font-size: 22px;
+    margin: 0 0 2px;
+    letter-spacing: 2px;
+    color: #ffffff;
+    text-shadow: 0 0 8px var(--magenta), 0 0 20px rgba(255,32,121,0.4);
+}
+
+.subtitle {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 16px;
+    letter-spacing: 1px;
+}
+
+h2 {
+    font-size: 12px;
+    margin: 24px 0 8px;
+    color: var(--purple);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    border-bottom: 1px dashed var(--border);
+    padding-bottom: 6px;
+}
+
+h2::before { content: "// "; color: var(--cyan); }
+
+.status-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #0a0a16;
+    padding: 14px 16px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    margin-top: 10px;
+}
+
+.status-left { display: flex; align-items: center; gap: 10px; }
+
+.dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: #444444;
+    transition: background .3s, box-shadow .3s;
+    flex-shrink: 0;
+}
+
+.dot.online {
+    background: var(--cyan);
+    box-shadow: 0 0 6px var(--cyan), 0 0 14px var(--cyan);
+    animation: pulse 1.6s infinite;
+}
+
+.dot.offline { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+
+.photo-count { font-size: 11px; color: var(--muted); text-align: right; letter-spacing: 1px; }
+.photo-count b { display: block; color: var(--yellow); font-size: 18px; text-shadow: 0 0 8px rgba(232,255,92,0.5); }
+
+label {
+    display: block;
+    margin-top: 12px;
+    font-size: 11px;
+    font-weight: bold;
+    color: var(--muted);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+
+input {
+    width: 100%;
+    padding: 10px;
+    margin-top: 4px;
+    background: #0a0a16;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 15px;
+    color: var(--cyan);
+    font-family: inherit;
+}
+
+input:focus {
+    outline: none;
+    border-color: var(--cyan);
+    box-shadow: 0 0 8px rgba(0,255,242,0.3);
+}
+
+button {
+    width: 100%;
+    padding: 13px;
+    margin-top: 12px;
+    border-radius: 4px;
+    font-size: 14px;
+    font-weight: bold;
+    cursor: pointer;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    font-family: inherit;
+    background: transparent;
+    transition: box-shadow .2s, transform .1s;
+}
+
+button:active { transform: scale(0.98); }
+button:disabled { opacity: .35; cursor: not-allowed; }
+
+.save { background: rgba(157,75,255,0.1); color: var(--purple); border: 1px solid var(--purple); }
+.save:hover:not(:disabled) { box-shadow: 0 0 12px rgba(157,75,255,0.5); }
+
+.photo { background: rgba(0,255,242,0.08); color: var(--cyan); border: 1px solid var(--cyan); font-size: 16px; padding: 16px; }
+.photo:hover:not(:disabled) { box-shadow: 0 0 16px rgba(0,255,242,0.5); }
+
+.connect { background: rgba(255,32,121,0.08); color: var(--magenta); border: 1px solid var(--magenta); }
+.connect:hover:not(:disabled) { box-shadow: 0 0 12px rgba(255,32,121,0.5); }
+
+.disconnect { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+
+.small { color: var(--muted); font-size: 11px; margin-top: 10px; text-align: center; }
+
+.printer-info { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.7; }
+.printer-info b { color: var(--text); }
+
+.check { display: flex; align-items: center; gap: 10px; text-transform: none; font-size: 13px; color: var(--text); }
+.check input { width: auto; margin: 0; }
+
+footer {
+    text-align: center;
+    margin-top: 22px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--border);
+    font-size: 11px;
+    letter-spacing: 1px;
+    color: var(--muted);
+}
+
+footer b { color: var(--cyan); text-shadow: 0 0 6px rgba(0,255,242,0.5); }
+
+.toast {
+    position: fixed;
+    left: 50%;
+    bottom: -60px;
+    transform: translateX(-50%);
+    background: #0d0d18;
+    color: var(--cyan);
+    border: 1px solid var(--cyan);
+    box-shadow: 0 0 16px rgba(0,255,242,0.3);
+    padding: 12px 20px;
+    border-radius: 4px;
+    font-size: 13px;
+    opacity: 0;
+    transition: bottom .3s, opacity .3s;
+    max-width: 90%;
+    text-align: center;
+    z-index: 100;
+    font-family: inherit;
+}
+
+.toast.show { bottom: 20px; opacity: 1; }
+.toast.error { color: var(--danger); border-color: var(--danger); box-shadow: 0 0 16px rgba(255,45,85,0.4); }
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<div class="eyebrow">&gt;&gt; REMOTE_SHUTTER_SYSTEM</div>
+<h1>SONY ZV-E10</h1>
+<div class="subtitle">controle remoto via ESP32 // link BLE</div>
+
+<div class="status-card">
+    <div class="status-left">
+        <span id="statusDot" class="dot offline"></span>
+        <span id="connectionStatus">Carregando...</span>
+    </div>
+    <div class="photo-count">
+        fotos
+        <b id="photoCount">0</b>
+    </div>
+</div>
+
+<h2>Controle</h2>
+
+<button id="btnPhoto" class="photo" onclick="takePhoto()" disabled>
+DISPARAR FOTO
+</button>
+
+<button id="btnConnect" class="connect" onclick="connectCamera()">
+CONECTAR À CÂMERA
+</button>
+
+<button class="disconnect" onclick="disconnectCamera()">
+DESCONECTAR
+</button>
+
+<p class="small">
+O botão físico dispara somente uma foto por pressionamento.
+</p>
+
+<h2>Bambu Lab A1</h2>
+
+<div class="status-card">
+    <div class="status-left">
+        <span id="printerDot" class="dot offline"></span>
+        <span id="printerStatus">Carregando...</span>
+    </div>
+    <div class="photo-count">
+        por camada
+        <b id="layerShots">0</b>
+    </div>
+</div>
+
+<div class="printer-info">
+    Estado: <b id="printerState">-</b><br>
+    Camada: <b id="printerLayer">-</b> &nbsp; Progresso: <b id="printerPercent">-</b>
+</div>
+
+<h2>Configurações</h2>
+
+<form action="/save" method="POST">
+
+<label>GPIO do botão</label>
+<input type="number" name="buttonPin" min="0" max="39" value="%BUTTON_PIN%">
+
+<label>Tempo Half Down → Fully Down (ms)</label>
+<input type="number" name="halfDown" min="0" max="10000" value="%HALF_DOWN%">
+
+<label>Tempo Fully Down → Fully Up (ms)</label>
+<input type="number" name="fullDown" min="0" max="10000" value="%FULL_DOWN%">
+
+<label>Tempo Fully Up → Half Up (ms)</label>
+<input type="number" name="fullUp" min="0" max="10000" value="%FULL_UP%">
+
+<label>Debounce do botão (ms)</label>
+<input type="number" name="debounce" min="10" max="2000" value="%DEBOUNCE%">
+
+<label>Intervalo mínimo entre fotos (ms)</label>
+<input type="number" name="minShot" min="0" max="10000" value="%MIN_SHOT%">
+
+<h2>Impressora (MQTT)</h2>
+
+<label class="check">
+<input type="checkbox" name="prnEnabled" value="1" %PRN_ENABLED%>
+Disparar a cada troca de camada
+</label>
+
+<label>Rede Wi-Fi (mesma da impressora)</label>
+<input type="text" name="wifiSsid" maxlength="32" value="%WIFI_SSID%">
+
+<label>Senha do Wi-Fi</label>
+<input type="password" name="wifiPass" maxlength="64" placeholder="%WIFI_PASS_HINT%">
+
+<label>IP da impressora</label>
+<input type="text" name="prnIp" maxlength="15" placeholder="192.168.0.50" value="%PRN_IP%">
+
+<label>Número de série</label>
+<input type="text" name="prnSerial" maxlength="20" value="%PRN_SERIAL%">
+
+<label>Access Code (tela da impressora)</label>
+<input type="password" name="prnCode" maxlength="16" placeholder="%PRN_CODE_HINT%">
+
+<label>Atraso após troca de camada (ms)</label>
+<input type="number" name="layerDelay" min="0" max="10000" value="%LAYER_DELAY%">
+
+<p class="small">
+Senhas em branco mantêm o valor salvo. Ao salvar, o ESP32 entra no canal
+da sua rede Wi-Fi e o celular pode precisar reconectar no Sony-ESP32.
+</p>
+
+<button class="save" type="submit">
+Salvar configurações
+</button>
+
+</form>
+
+<footer>Criado por <b>Acioli Enterprises</b></footer>
+
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+let busy = false;
+let toastTimer = null;
+
+function showToast(msg, isError) {
+    const toast = document.getElementById('toast');
+    toast.textContent = msg;
+    toast.className = 'toast show' + (isError ? ' error' : '');
+
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+        toast.className = 'toast';
+    }, 3000);
+}
+
+async function takePhoto() {
+    if (busy) return;
+    busy = true;
+
+    try {
+        const r = await fetch('/photo', { method: 'POST' });
+        showToast(await r.text(), !r.ok);
+    } catch (e) {
+        showToast('Erro de comunicação com o ESP32', true);
+    }
+
+    busy = false;
+    updateStatus();
+}
+
+async function connectCamera() {
+    const btn = document.getElementById('btnConnect');
+    btn.disabled = true;
+    btn.textContent = 'CONECTANDO... (até 10s)';
+
+    try {
+        const r = await fetch('/connect', { method: 'POST' });
+        showToast(await r.text(), !r.ok);
+    } catch (e) {
+        showToast('Erro de comunicação com o ESP32', true);
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'CONECTAR À CÂMERA';
+    updateStatus();
+}
+
+async function disconnectCamera() {
+    try {
+        const r = await fetch('/disconnect', { method: 'POST' });
+        showToast(await r.text(), !r.ok);
+    } catch (e) {
+        showToast('Erro de comunicação com o ESP32', true);
+    }
+
+    updateStatus();
+}
+
+async function updateStatus() {
+    try {
+        const r = await fetch('/status');
+        const data = await r.json();
+
+        const dot = document.getElementById('statusDot');
+        const label = document.getElementById('connectionStatus');
+        const photoBtn = document.getElementById('btnPhoto');
+
+        dot.className = 'dot ' + (data.connected ? 'online' : 'offline');
+        label.textContent = data.connected ? 'Conectada' : 'Desconectada';
+        document.getElementById('photoCount').textContent = data.photos;
+
+        photoBtn.disabled = !data.connected || data.shooting || busy;
+        photoBtn.textContent = data.shooting ? 'DISPARANDO...' : 'DISPARAR FOTO';
+
+        const p = data.printer;
+        let pText = 'Desativada';
+        if (p.enabled) {
+            if (!p.stage2) pText = 'Aguardando câmera (etapa 1)';
+            else if (!p.wifi) pText = 'Sem Wi-Fi';
+            else if (!p.mqtt) pText = 'Wi-Fi OK, sem MQTT';
+            else pText = 'Conectada';
+        }
+        document.getElementById('printerDot').className = 'dot ' + (p.mqtt ? 'online' : 'offline');
+        document.getElementById('printerStatus').textContent = pText;
+        document.getElementById('printerState').textContent = p.state || '-';
+        document.getElementById('printerLayer').textContent =
+            p.layer >= 0 ? (p.layer + '/' + p.total) : '-';
+        document.getElementById('printerPercent').textContent =
+            p.percent >= 0 ? (p.percent + '%') : '-';
+        document.getElementById('layerShots').textContent = p.layerShots;
+    } catch (e) {
+        // ESP32 fica ocupado durante o scan BLE (ate 10s); ignora falhas pontuais de status
+    }
+}
+
+setInterval(updateStatus, 1500);
+updateStatus();
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+    html.replace("%BUTTON_PIN%", String(buttonPin));
+    html.replace("%HALF_DOWN%", String(halfDownDelay));
+    html.replace("%FULL_DOWN%", String(fullDownDelay));
+    html.replace("%FULL_UP%", String(fullUpDelay));
+    html.replace("%DEBOUNCE%", String(debounceDelay));
+    html.replace("%MIN_SHOT%", String(minShotDelay));
+
+    html.replace("%PRN_ENABLED%", printerEnabled ? "checked" : "");
+    html.replace("%WIFI_SSID%", htmlEscape(wifiSsid));
+    html.replace("%WIFI_PASS_HINT%", wifiPass.length() ? "(salva)" : "");
+    html.replace("%PRN_IP%", htmlEscape(printerIp));
+    html.replace("%PRN_SERIAL%", htmlEscape(printerSerial));
+    html.replace("%PRN_CODE_HINT%", printerAccessCode.length() ? "(salvo)" : "");
+    html.replace("%LAYER_DELAY%", String(layerShotDelay));
+
+    return html;
+}
+
+// ============================================================
+// ROTAS WEB
+// ============================================================
+
+void handleRoot()
+{
+    server.send(200, "text/html; charset=utf-8", htmlPage());
+}
+
+void handleSave()
+{
+    if (server.hasArg("buttonPin"))
+        buttonPin = server.arg("buttonPin").toInt();
+
+    if (server.hasArg("halfDown"))
+        halfDownDelay = server.arg("halfDown").toInt();
+
+    if (server.hasArg("fullDown"))
+        fullDownDelay = server.arg("fullDown").toInt();
+
+    if (server.hasArg("fullUp"))
+        fullUpDelay = server.arg("fullUp").toInt();
+
+    if (server.hasArg("debounce"))
+        debounceDelay = server.arg("debounce").toInt();
+
+    if (server.hasArg("minShot"))
+        minShotDelay = server.arg("minShot").toInt();
+
+    if (buttonPin < 0 || buttonPin > 39)
+        buttonPin = DEFAULT_BUTTON_PIN;
+
+    if (halfDownDelay > 10000)
+        halfDownDelay = DEFAULT_HALF_DOWN_DELAY;
+
+    if (fullDownDelay > 10000)
+        fullDownDelay = DEFAULT_FULL_DOWN_DELAY;
+
+    if (fullUpDelay > 10000)
+        fullUpDelay = DEFAULT_FULL_UP_DELAY;
+
+    if (debounceDelay < 10 || debounceDelay > 2000)
+        debounceDelay = DEFAULT_DEBOUNCE_DELAY;
+
+    if (minShotDelay > 10000)
+        minShotDelay = DEFAULT_MIN_SHOT_DELAY;
+
+    // ---- Impressora ----
+    // Checkbox desmarcado nao e enviado; so mexe nele se o form for o completo
+    bool printerFormPresent = server.hasArg("prnIp");
+
+    bool oldEnabled = printerEnabled;
+    String oldSsid = wifiSsid, oldPass = wifiPass;
+    String oldIp = printerIp, oldSerial = printerSerial, oldCode = printerAccessCode;
+
+    if (printerFormPresent)
+    {
+        printerEnabled = server.hasArg("prnEnabled");
+
+        wifiSsid = server.arg("wifiSsid");
+        wifiSsid.trim();
+
+        printerIp = server.arg("prnIp");
+        printerIp.trim();
+
+        printerSerial = server.arg("prnSerial");
+        printerSerial.trim();
+        printerSerial.toUpperCase();
+
+        // Campos de senha vazios mantem o valor salvo
+        if (server.arg("wifiPass").length() > 0)
+            wifiPass = server.arg("wifiPass");
+
+        if (server.arg("prnCode").length() > 0)
+        {
+            printerAccessCode = server.arg("prnCode");
+            printerAccessCode.trim();
+        }
+    }
+
+    if (server.hasArg("layerDelay"))
+        layerShotDelay = server.arg("layerDelay").toInt();
+
+    if (layerShotDelay > 10000)
+        layerShotDelay = DEFAULT_LAYER_SHOT_DELAY;
+
+    bool printerChanged =
+        oldEnabled != printerEnabled ||
+        oldSsid != wifiSsid || oldPass != wifiPass ||
+        oldIp != printerIp || oldSerial != printerSerial ||
+        oldCode != printerAccessCode;
+
+    saveSettings();
+    configureButtonPin();
+
+    server.sendHeader("Location", "/");
+    server.send(303);
+
+    // Depois da resposta: trocar de rede pode mudar o canal do AP
+    if (printerChanged)
+    {
+        delay(200);
+        restartPrinterConnection();
+    }
+}
+
+void handlePhoto()
+{
+    if (shooting)
+    {
+        server.send(409, "text/plain; charset=utf-8", "Disparo ignorado: outra sequência está em andamento.");
+        return;
+    }
+
+    if (!connected)
+    {
+        server.send(503, "text/plain; charset=utf-8", "Câmera não conectada.");
+        return;
+    }
+
+    takePhoto();
+
+    server.send(200, "text/plain; charset=utf-8", "Disparo concluído.");
+}
+
+void handleConnect()
+{
+    bool result = connectToCamera();
+
+    if (result)
+    {
+        server.send(200, "text/plain; charset=utf-8", "Câmera conectada.");
+    }
+    else
+    {
+        server.send(500, "text/plain; charset=utf-8", "Não foi possível conectar à câmera.");
+    }
+}
+
+void handleDisconnect()
+{
+    disconnectFromCamera();
+    server.send(200, "text/plain; charset=utf-8", "Câmera desconectada.");
+}
+
+void handleStatus()
+{
+    String json = "{";
+    json += "\"connected\":";
+    json += connected ? "true" : "false";
+    json += ",\"shooting\":";
+    json += shooting ? "true" : "false";
+    json += ",\"photos\":";
+    json += String(photoCount);
+
+    String stateJson = printerState;
+    stateJson.replace("\"", "");
+
+    json += ",\"printer\":{";
+    json += "\"enabled\":";
+    json += printerEnabled ? "true" : "false";
+    json += ",\"wifi\":";
+    json += WiFi.status() == WL_CONNECTED ? "true" : "false";
+    json += ",\"stage2\":";
+    json += printerStageStarted ? "true" : "false";
+    json += ",\"mqtt\":";
+    json += mqtt.connected() ? "true" : "false";
+    json += ",\"state\":\"" + stateJson + "\"";
+    json += ",\"layer\":" + String(printerLayer);
+    json += ",\"total\":" + String(printerTotalLayers);
+    json += ",\"percent\":" + String(printerPercent);
+    json += ",\"layerShots\":" + String(layerShots);
+    json += "}";
+
+    json += "}";
+
+    server.send(200, "application/json; charset=utf-8", json);
+}
+
+// Qualquer URL desconhecida redireciona para "/".
+// É o truque padrão que faz Android/iOS/Windows abrirem
+// a página de login automaticamente ao entrar no Wi-Fi do ESP32.
+void handleNotFound()
+{
+    server.sendHeader("Location", "/", true);
+    server.send(302, "text/plain", "");
+}
+
+// ============================================================
+// CONFIGURAR WI-FI, DNS E SERVIDOR
+// ============================================================
+
+void setupWebServer()
+{
+    // Comeca so com o AP (portal). startStation() adiciona a estacao
+    // (rede da impressora) quando ela estiver configurada.
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+    // So AP: pode desligar o sleep (menos interferencia com o BLE).
+    // startStation() religa antes de criar a interface de estacao.
+    WiFi.setSleep(false);
+
+    IPAddress apIP = WiFi.softAPIP();
+
+    dnsServer.start(DNS_PORT, "*", apIP);
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("WI-FI CONFIGURADO");
+    Serial.print("Rede: ");
+    Serial.println(AP_SSID);
+    Serial.print("IP: ");
+    Serial.println(apIP);
+    Serial.println("========================================");
+
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/save", HTTP_POST, handleSave);
+    server.on("/photo", HTTP_POST, handlePhoto);
+    server.on("/connect", HTTP_POST, handleConnect);
+    server.on("/disconnect", HTTP_POST, handleDisconnect);
+    server.on("/status", HTTP_GET, handleStatus);
+    server.onNotFound(handleNotFound);
+
+    server.begin();
+
+    Serial.println("Servidor web iniciado.");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+    delay(1000);
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("SONY ZV-E10 - ESP32 REMOTE V7");
+    Serial.println("========================================");
+
+    loadSettings();
+    configureButtonPin();
+
+    // Alocacoes grandes ANTES do Bluetooth (que fragmenta a memoria):
+    // buffer do MQTT e o bloco reservado para o TLS da etapa 2.
+    mqtt.setCallback(onMqttMessage);
+    mqtt.setBufferSize(MQTT_BUFFER_SIZE);
+    mqtt.setKeepAlive(30);      // o scan BLE bloqueia ate 10 s
+    // Handshake TLS no ESP32 + resposta da impressora pode passar de 5 s
+    mqtt.setSocketTimeout(20);
+
+    if (printerEnabled)
+        takeTlsReserve();
+
+    // So usamos BLE: devolve ao heap a RAM do Bluetooth classico.
+    // Precisa vir ANTES de BLEDevice::init().
+    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+
+    // Bluetooth original (Bluedroid) - e com ele que a ZV-E10 esta pareada
+    BLEDevice::init("");
+    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
+    BLEDevice::setSecurityCallbacks(new MySecurity());
+
+    Serial.print("Heap livre apos BLE: ");
+    Serial.println(ESP.getFreeHeap());
+
+    // So o AP (portal). A rede da impressora entra na etapa 2.
+    setupWebServer();
+
+    WiFi.onEvent(onWifiEvent);
+
+    Serial.println();
+    Serial.println("Comandos seriais:");
+    Serial.println("F = disparar foto");
+    Serial.println("C = conectar");
+    Serial.println("D = desconectar");
+    Serial.println("P = status da impressora");
+    Serial.println("========================================");
+
+    // ---- ETAPA 1: camera ----
+    Serial.println();
+    Serial.println(">>> ETAPA 1: conectando a camera...");
+
+    lastCameraAttempt = millis();
+    connectToCamera();
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+    dnsServer.processNextRequest();
+    server.handleClient();
+
+    checkButton();
+
+    stageLoop();
+
+    printerLoop();
+
+    if (Serial.available())
+    {
+        char command = Serial.read();
+
+        if (command == 'F' || command == 'f')
+        {
+            takePhoto();
+        }
+        else if (command == 'C' || command == 'c')
+        {
+            connectToCamera();
+        }
+        else if (command == 'D' || command == 'd')
+        {
+            disconnectFromCamera();
+        }
+        else if (command == 'P' || command == 'p')
+        {
+            Serial.println();
+            Serial.print("Impressora ativada: ");
+            Serial.println(printerEnabled ? "sim" : "nao");
+            Serial.print("Wi-Fi: ");
+            Serial.println(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("desconectado"));
+            Serial.print("MQTT: ");
+            Serial.println(mqtt.connected() ? "conectado" : "desconectado");
+            Serial.print("Estado: ");
+            Serial.println(printerState.length() ? printerState : "?");
+            Serial.print("Camada: ");
+            Serial.print(printerLayer);
+            Serial.print("/");
+            Serial.println(printerTotalLayers);
+            Serial.print("Fotos por camada: ");
+            Serial.println(layerShots);
+            Serial.print("Heap livre: ");
+            Serial.println(ESP.getFreeHeap());
+        }
+    }
+
+    delay(5);
+}
