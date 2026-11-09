@@ -55,3 +55,11 @@ Ajuste o "Atraso após troca de camada" no portal para a foto cair dentro dessa 
 - **Endereço Bluetooth:** o firmware usa um endereço "administrado localmente" para a câmera
   parear do zero caso guarde uma chave antiga.
 - `backup/` guarda versões anteriores do firmware para referência.
+
+## Licença
+
+Distribuído sob a licença **MIT**: veja [LICENSE](LICENSE).
+A biblioteca em `lib/PubSubClient` (de Nick O'Leary) também é MIT e mantém a própria licença
+em `lib/PubSubClient/LICENSE.txt`.
+
+Projeto independente, sem vínculo com a Sony ou a Bambu Lab.
